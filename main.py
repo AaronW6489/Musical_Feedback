@@ -14,6 +14,14 @@ def midi_to_note_name(midi_num):
     name = names[midi_num % 12]
     return f"{name}{octave}"    
 
+def freq_to_note_name(freq):
+    """Convert frequency (Hz) to nearest MIDI note name."""
+    try:
+        midi = int(round(69 + 12 * np.log2(freq / 440.0)))
+        return midi_to_note_name(midi)
+    except Exception:
+        return None
+
 class MusicApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -22,6 +30,9 @@ class MusicApp(tk.Tk):
         self.configure(bg="#ecf0f1")
 
         setup_styles()
+
+        # warm up pitch detection in background to avoid UI freeze later
+        threading.Thread(target=self._warmup_pitch_detection, daemon=True).start()
 
         self.instrument = tk.StringVar(value="piano")
         self.sheet_path = None
@@ -33,6 +44,15 @@ class MusicApp(tk.Tk):
         self.playhead = None
 
         self.create_widgets()
+
+    def _warmup_pitch_detection(self):
+        """Call a lightweight piptrack operation to import heavy deps and warm up numba/librosa."""
+        try:
+            small = np.zeros(1024, dtype=float)
+            # small warmup; ignore results
+            _p, _m = librosa.piptrack(y=small, sr=22050)
+        except Exception:
+            pass
 
     def create_widgets(self):
         self.main_frame.pack(fill='both', expand=True, padx=20, pady=20)
@@ -113,7 +133,7 @@ class MusicApp(tk.Tk):
         def countdown_and_record():
             import time
             import sounddevice as sd
-            from scipy.io.wavfile import write
+            from scipy.io.wavfile import write, read
             import tempfile
             chunk_sec = 0.5
             fs = 44100
@@ -128,11 +148,13 @@ class MusicApp(tk.Tk):
             steps = int(duration * 60)
             visible_window = 4.0
             note_rects = []
+            evaluated = set()
+            evaluation_results = {}  # (note, start_time) -> bool
             for note, start_beat, duration_beat in midi_notes:
                 start_time = start_beat * 60 / bpm
                 end_time = (start_beat + duration_beat) * 60 / bpm
                 y = (max_note - note) * note_height
-                rect = self.canvas.create_rectangle(-10, -10, -10, -10, fill='skyblue', outline='black', tags='note')
+                rect = self.canvas.create_rectangle(-10, -10, -10, -10, fill='deepskyblue', outline='black', tags='note')
                 note_rects.append((rect, start_time, end_time, y, note))
             # Real-time audio buffer
             total_samples = int(duration * fs)
@@ -171,12 +193,20 @@ class MusicApp(tk.Tk):
                         for i in range(pitches.shape[1]):
                             idx = np.argmax(mags[:, i])
                             freq = pitches[idx, i]
-                            if mags[idx, i] > 0.1 and 30 < freq < 4200:
+                            if mags[idx, i] > 0.05 and 30 < freq < 4200:
                                 detected_pitches.append(freq)
-                        # Remove duplicates and sort
-                        detected_pitches = sorted(set([round(f,1) for f in detected_pitches if f > 0]))
+                        # map to nearest midi note names and deduplicate
+                        detected_pitches = [round(f,1) for f in detected_pitches if f > 0]
+                        detected_names = []
+                        seen = set()
+                        for fp in detected_pitches:
+                            nm = freq_to_note_name(fp)
+                            if nm and nm not in seen:
+                                seen.add(nm)
+                                detected_names.append(nm)
                     except Exception:
                         detected_pitches = []
+                        detected_names = []
                     # Find all expected notes at this time (chord)
                     expected_notes = []
                     for note, start_beat, duration_beat in midi_notes:
@@ -193,10 +223,23 @@ class MusicApp(tk.Tk):
                             efreq = midi_to_freq(n)
                             match = any(abs(np.log2(p/efreq)) < 1/12 for p in detected_pitches)
                             corrects.append(match)
+                        # Update colors for evaluated notes when their start time has passed
+                        for rect, st, et, y, note in note_rects:
+                            if note in expected_notes and (note, st) not in evaluated and cur_time >= st:
+                                # find match for this note
+                                efreq = midi_to_freq(note)
+                                is_match = any(abs(np.log2(p/efreq)) < 1/12 for p in detected_pitches)
+                                color = 'green' if is_match else 'red'
+                                try:
+                                    self.canvas.itemconfig(rect, fill=color)
+                                except Exception:
+                                    pass
+                                evaluated.add((note, st))
+                                evaluation_results[(note, st)] = is_match
                         total_count += len(expected_notes)
                         correct_count += sum(corrects)
-                        detected_str = "+".join(f"{p:.0f}" for p in detected_pitches) if detected_pitches else "-"
-                        msg = f"Now: {expected_names} | Detected: {detected_str} Hz\nCorrect: {sum(corrects)}/{len(corrects)} | Accuracy: {100*correct_count/total_count:.1f}%"
+                        detected_str = "+".join(detected_names) if detected_names else "-"
+                        msg = f"Now: {expected_names} | Detected: {detected_str}\nCorrect: {sum(corrects)}/{len(corrects)} | Accuracy: {100*correct_count/total_count:.1f}%"
                     else:
                         detected_str = "+".join(f"{p:.0f}" for p in detected_pitches) if detected_pitches else "-"
                         msg = f"No note expected | Detected: {detected_str} Hz\nAccuracy: {100*correct_count/total_count:.1f}%" if total_count else ""
@@ -209,11 +252,186 @@ class MusicApp(tk.Tk):
             wav_path = temp_dir + "/user_recording.wav"
             write(wav_path, fs, audio_buffer)
             self.music_status.config(text=f"Recording complete!\nFinal Accuracy: {100*correct_count/max(1,total_count):.1f}%")
-            self.canvas.delete('all')
+            # After recording, run playback review: replay the recorded audio and the MIDI with colored feedback
+            try:
+                self.playback_and_review(wav_path, midi_notes, bpm, evaluation_results, note_rects, keyboard_width, note_height, roll_width, duration)
+            except Exception:
+                pass
+        threading.Thread(target=countdown_and_record, daemon=True).start()
+
+    def playback_and_review(self, wav_path, midi_notes, bpm, evaluation_results, note_rects, keyboard_width, note_height, roll_width, duration):
+        """Play the recorded WAV and replay the MIDI visualization, showing which notes were correct/incorrect.
+
+        This version updates a review label live as notes pass and provides an on-screen
+        button to return to the home screen when the user is ready.
+        """
+        import time, sounddevice as sd, os
+        from scipy.io.wavfile import read
+        # optional OpenAI feedback
+        try:
+            import openai
+            openai_available = True
+        except Exception:
+            openai_available = False
+        # Load audio
+        sr, data = read(wav_path)
+        if data.ndim > 1:
+            audio = data[:,0].astype(float) / 32768.0
+        else:
+            audio = data.astype(float) / 32768.0
+        # Slightly increase playback volume (avoid clipping)
+        gain = 1.6
+        audio = np.clip(audio * gain, -1.0, 1.0)
+        # Reset rectangles to blue
+        for rect, st, et, y, note in note_rects:
+            try:
+                self.canvas.itemconfig(rect, fill='deepskyblue')
+            except Exception:
+                pass
+        self.canvas.update()
+        # Prepare a scrollable review area under the MIDI display (Text + Scrollbar)
+        if not hasattr(self, 'review_container'):
+            self.review_container = ttk.Frame(self.music_frame)
+            self.review_container.pack(fill='x', padx=10, pady=6)
+            # vertical scrollbar
+            self.review_scroll = ttk.Scrollbar(self.review_container, orient='vertical')
+            self.review_text = tk.Text(self.review_container, height=8, wrap='word', yscrollcommand=self.review_scroll.set, font=("Segoe UI", 11))
+            self.review_scroll.config(command=self.review_text.yview)
+            self.review_scroll.pack(side='right', fill='y')
+            self.review_text.pack(side='left', fill='x', expand=True)
+            self.review_text.config(state='disabled')
+        # helper to update the review area safely
+        def set_review(txt):
+            try:
+                self.review_text.config(state='normal')
+                self.review_text.delete('1.0', 'end')
+                self.review_text.insert('end', txt)
+                self.review_text.see('end')
+                self.review_text.config(state='disabled')
+            except Exception:
+                pass
+
+        # live feedback history
+        feedback_history = []
+        announced = set()
+        set_review('Playing back your recording and reviewing...')
+        self.music_frame.update()
+        # Play audio
+        sd.play(audio, sr)
+        start = time.time()
+        steps = int(duration * 60)
+        px_per_sec = roll_width / 4.0
+        max_note = max((n for n,_,_ in midi_notes), default=72)
+        for t in range(steps):
+            cur_time = time.time() - start
+            # update positions
+            for rect, st, et, y, note in note_rects:
+                x1 = keyboard_width + (st - cur_time) * px_per_sec
+                x2 = keyboard_width + (et - cur_time) * px_per_sec
+                if x2 < keyboard_width or x1 > keyboard_width + roll_width:
+                    self.canvas.coords(rect, -10, -10, -10, -10)
+                else:
+                    self.canvas.coords(rect, x1, y+4, x2, y+note_height-4)
+                # color according to evaluation_results when passed
+                key = (note, st)
+                if key in evaluation_results:
+                    color = 'green' if evaluation_results[key] else 'red'
+                    try:
+                        self.canvas.itemconfig(rect, fill=color)
+                    except Exception:
+                        pass
+            # live feedback: announce notes as they pass (once)
+            for key, ok in list(evaluation_results.items()):
+                note, st = key
+                if st <= cur_time and key not in announced:
+                    announced.add(key)
+                    name = midi_to_note_name(note)
+                    msg = (f"Good: {name} at {st:.2f}s" if ok else f"Missed: {name} at {st:.2f}s")
+                    feedback_history.append(msg)
+                    # keep last few entries visible
+                    recent = "\n".join(feedback_history[-6:])
+                    try:
+                        set_review(recent)
+                    except Exception:
+                        pass
+            self.canvas.update()
+            time.sleep(1/60)
+        sd.stop()
+        # After playback, provide a single summarized feedback string below the live feed
+        # show a short "compiling summary" message while we prepare the final summary
+        try:
+            set_review("Compiling summary...")
+            self.music_frame.update()
+        except Exception:
+            pass
+
+        wrong = [ (n, st) for (n, st), ok in evaluation_results.items() if not ok ]
+        total_notes = max(1, len(note_rects))
+        wrong_count = len(wrong)
+        ratio = wrong_count / total_notes
+
+        # Build a user-friendly summary that generalizes when many notes are missed
+        if wrong_count == 0:
+            summary = "Great job! All notes were played correctly in timing."
+        elif ratio > 0.5:
+            summary = "Many notes were played incorrectly — try slowing the piece down and isolating the difficult passages."
+        elif ratio > 0.2:
+            summary = "Some notes were played incorrectly. Focus on the highlighted measures and practice slowly."
+        else:
+            msgs = [f"{midi_to_note_name(n)} at {st:.2f}s" for n,st in wrong]
+            summary = "You missed the following notes: " + ", ".join(msgs) + ". Try slowing down those passages and focus on hand coordination."
+
+        # Optionally refine summary via OpenAI if available
+        try:
+            if openai_available and os.getenv('OPENAI_API_KEY'):
+                openai.api_key = os.getenv('OPENAI_API_KEY')
+                prompt = (
+                    f"The performer made mistakes on these notes: {', '.join([f'{n}@{st:.2f}s' for n,st in wrong])}. "
+                    "Provide concise, actionable, friendly feedback to help them improve, focusing on rhythm, hand coordination, and practice tips."
+                )
+                resp = openai.ChatCompletion.create(model="gpt-4", messages=[{"role":"user","content":prompt}], max_tokens=200)
+                refined = resp.choices[0].message.content.strip()
+                if refined:
+                    summary = refined
+        except Exception:
+            pass
+
+        # show final summary in the review label (append) then keep it until user returns home
+        feedback_history.append("--- Summary ---")
+        feedback_history.append(summary)
+        try:
+            set_review("\n".join(feedback_history[-8:]))
+            self.music_frame.update()
+        except Exception:
+            pass
+
+        # Do not auto-clear the summary; leave it visible until the user clicks Return to Home.
+        # (previous behavior cleared the label after a timeout; removed so user can read at leisure)
+
+        # Create an on-screen button so the user can return to the home screen when ready
+        def return_home():
+            try:
+                self.canvas.delete('all')
+            except Exception:
+                pass
+            # clean up review widgets
+            try:
+                self.review_container.destroy()
+            except Exception:
+                pass
+            try:
+                back_btn.destroy()
+            except Exception:
+                pass
+            # show main UI
             self.music_frame.pack_forget()
             self.main_frame.pack(fill='both', expand=True)
-            self.feedback_label.config(text=f"Recording complete! Saved to: {wav_path}\nFinal Accuracy: {100*correct_count/max(1,total_count):.1f}%")
-        threading.Thread(target=countdown_and_record, daemon=True).start()
+            # update the feedback label on the main screen
+            self.feedback_label.config(text=f"Recording complete! Saved to: {wav_path}\nFinal Accuracy: {100*sum(1 for ok in evaluation_results.values() if ok)/max(1,len(evaluation_results)):.1f}%")
+
+        back_btn = ttk.Button(self.music_frame, text="Return to Home", command=return_home)
+        # ensure the button is large enough and visible
+        back_btn.pack(pady=8, ipadx=12, ipady=6)
 
     def draw_keyboard(self, min_note, max_note, note_height, keyboard_width, height):
         self.canvas.delete('all')
