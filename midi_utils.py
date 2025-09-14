@@ -14,6 +14,22 @@ def get_midi_total_beats(midi_path):
     total_beats = total_ticks / ticks_per_beat
     return total_beats
 
+def get_midi_tempo(midi_path):
+    """
+    Extract the first tempo (microseconds per beat) from the MIDI file and return BPM.
+    If no tempo message exists, return a sensible default (120 BPM).
+    """
+    mid = MidiFile(midi_path)
+    for track in mid.tracks:
+        for msg in track:
+            if msg.type == 'set_tempo':
+                # mido gives tempo in microseconds per beat
+                mpb = msg.tempo
+                bpm = 60000000 / mpb if mpb > 0 else 120
+                return int(round(bpm))
+    # fallback default
+    return 120
+
 # Optionally, you can extract the note sequence for further analysis
 
 def get_midi_notes(midi_path):

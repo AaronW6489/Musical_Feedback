@@ -20,14 +20,22 @@ def match_notes_to_audio(y, sr, midi_notes, bpm):
         end_sample = int(end_time * sr)
         chunk = y[start_sample:end_sample]
         if len(chunk) == 0:
-            results.append((note, None, False, (start_time, end_time)))
+            results.append((note, None, False, (start_time, end_time), 0.0, 0.0))
             continue
+        # pitch detection
         pitches, magnitudes = librosa.piptrack(y=chunk, sr=sr)
         pitch = np.max(pitches)
         expected_freq = midi_to_freq(note)
         # Allow a tolerance of +/- 1 semitone
         correct = pitch > 0 and abs(np.log2(pitch/expected_freq)) < 1/12
-        results.append((note, pitch if pitch > 0 else None, correct, (start_time, end_time)))
+        # duration detection (energy-based onset/offset estimation)
+        energy = np.abs(chunk).astype(float)
+        rms = np.sqrt(np.mean((energy/32768.0)**2)) if len(energy) > 0 else 0.0
+        # crude duration estimate: proportion of samples above a small threshold
+        thresh = np.max(np.abs(chunk)) * 0.2 if len(chunk) > 0 else 0
+        active = np.sum(np.abs(chunk) > thresh)
+        dur_est = (active / sr) if sr > 0 else 0.0
+        results.append((note, pitch if pitch > 0 else None, correct, (start_time, end_time), dur_est, rms))
     return results
 
 def performance_summary(results):
