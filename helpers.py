@@ -16,7 +16,7 @@ def midi_to_note_name(midi_num):
 
 
 def open_tuner_window(parent):
-    """Open a tuner Toplevel window attached to `parent` (a Tk instance).
+    """Open a tuner window attached to `parent` (a Tk instance).
     This duplicates minimal helpers to keep tuner code separate from main.
     """
     win = tk.Toplevel(parent)

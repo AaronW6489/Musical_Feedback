@@ -30,8 +30,6 @@ def get_midi_tempo(midi_path):
     # fallback default
     return 120
 
-# Optionally, you can extract the note sequence for further analysis
-
 def get_midi_notes(midi_path):
     """
     Returns a list of (note, start_beat, duration_beat) tuples from the MIDI file.
